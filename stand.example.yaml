@@ -1,0 +1,53 @@
+# Пример описания стенда. Скопируй в stand.yaml и поправь под себя.
+name: demo-stand
+node: pve                # имя узла в Proxmox (Datacenter -> имя ноды)
+pool: stand-demo         # пул ТОЛЬКО под этот стенд: при удалении чистится целиком
+full_clone: false        # false = связанные клоны (быстро), true = полные копии
+
+# Изолированные сети (Linux-бриджи без физических портов)
+networks:
+  - bridge: vmbr101
+    comment: LAN1
+  - bridge: vmbr102
+    comment: LAN2
+
+vms:
+  - name: srv
+    template: 9000       # VMID шаблона ВМ в Proxmox
+    cores: 2
+    memory: 2048         # МБ
+    nics:
+      - bridge: vmbr101
+      - bridge: vmbr102
+    start: true
+
+  - name: client       # count: 3 -> client-1, client-2, client-3
+    template: 9001
+    count: 3
+    cores: 2
+    memory: 4096
+    nics:
+      - bridge: vmbr101
+    start: true
+
+# Пользователи получают роль на пул стенда (по умолчанию PVEVMUser).
+# Если задан "participants" (см. ниже), эти пользователи используются как
+# запасной вариант для участников, у которых свои users не указаны.
+users:
+  - id: student1@pve
+    password: ChangeMe123!
+
+# Необязательно: несколько копий стенда — по одной на участника/команду.
+# Каждая копия получает свой пул (stand-demo-team1, stand-demo-team2, ...),
+# свои ВМ (srv-team1, client-1-team1, ...) и своих пользователей.
+# Если блок participants не нужен — просто удали его целиком.
+#
+# participants:
+#   - id: team1
+#     users:
+#       - id: team1_student@pve
+#         password: Team1Pass123!
+#   - id: team2
+#     users:
+#       - id: team2_student@pve
+#         password: Team2Pass123!
