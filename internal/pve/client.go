@@ -8,18 +8,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client — клиент API Proxmox.
 type Client struct {
-	base string
-	auth string
-	http *http.Client
+	base     string
+	auth     string
+	http     *http.Client
+	idMu     sync.Mutex
+	reserved map[int]bool
+	secrets  []string
 }
 
 // APIError — ошибка, вернувшаяся от API.
@@ -28,7 +33,17 @@ type APIError struct {
 	Msg    string
 }
 
-func (e *APIError) Error() string { return e.Msg }
+func (e *APIError) Error() string {
+	switch e.Status {
+	case 401:
+		return "ошибка авторизации: " + e.Msg
+	case 403:
+		return "недостаточно прав: " + e.Msg
+	case 404:
+		return "ресурс не найден: " + e.Msg
+	}
+	return e.Msg
+}
 
 // IsExists — ресурс уже существует.
 func IsExists(err error) bool {
@@ -41,8 +56,13 @@ func IsMissing(err error) bool {
 		return false
 	}
 	var ae *APIError
-	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
-		return true
+	if errors.As(err, &ae) {
+		if ae.Status == http.StatusNotFound {
+			return true
+		}
+		if ae.Status == 401 || ae.Status == 403 {
+			return false
+		}
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "does not exist") || strings.Contains(s, "no such")
@@ -61,18 +81,62 @@ func New(host, token string, insecure bool) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if u.Port() == "" {
-		u.Host += ":8006"
+	if u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, errors.New("некорректный адрес Proxmox")
 	}
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}}
+	if u.Port() == "" {
+		u.Host = net.JoinHostPort(u.Hostname(), "8006")
+	}
+	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/api2/json")
+	tr := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout: 60 * time.Second, MaxIdleConns: 16, MaxIdleConnsPerHost: 8,
+	}
 	return &Client{
-		base: strings.TrimRight(u.String(), "/") + "/api2/json",
-		auth: token,
-		http: &http.Client{Transport: tr, Timeout: 60 * time.Second},
+		base:     strings.TrimRight(u.String(), "/") + "/api2/json",
+		auth:     token,
+		http:     &http.Client{Transport: tr, Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		reserved: map[int]bool{},
 	}, nil
 }
 
+// do repeats only GET requests. A failed write may already have changed the server.
 func (c *Client) do(ctx context.Context, method, path string, params url.Values, out any) error {
+	if method != http.MethodGet {
+		return c.doOnce(ctx, method, path, params, out)
+	}
+	const attempts = 3
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = c.doOnce(ctx, method, path, params, out)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s %s: ожидание ответа отменено: %w", method, path, ctx.Err())
+		}
+		if !retryableRead(err) {
+			return err
+		}
+		if attempt+1 < attempts {
+			timer := time.NewTimer(time.Duration(1<<attempt) * 200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("%s %s: повтор запроса отменён: %w", method, path, ctx.Err())
+			case <-timer.C:
+			}
+		}
+	}
+	return fmt.Errorf("%s %s: не удалось получить полный ответ Proxmox после %d попыток; проверьте соединение и журнал pveproxy: %w", method, path, attempts, err)
+}
+
+func (c *Client) doOnce(ctx context.Context, method, path string, params url.Values, out any) error {
 	target := c.base + path
 	var body io.Reader
 	if len(params) > 0 {
@@ -102,7 +166,7 @@ func (c *Client) do(ctx context.Context, method, path string, params url.Values,
 	if resp.StatusCode >= 300 {
 		return &APIError{
 			Status: resp.StatusCode,
-			Msg:    fmt.Sprintf("%s %s: %s %s", method, path, resp.Status, strings.TrimSpace(string(raw))),
+			Msg:    c.Redact(fmt.Sprintf("%s %s: %s %s", method, path, resp.Status, strings.TrimSpace(string(raw)))),
 		}
 	}
 	if out == nil {
@@ -142,32 +206,35 @@ func rawFields(ctx context.Context, c *Client, method, path string) (map[string]
 
 // ---------- Задачи ----------
 
-// WaitTask ждёт завершения задачи по UPID. Пустой UPID — ничего не ждём.
+// WaitTask returns the complete task log on failure; cancellation only stops waiting.
 func (c *Client) WaitTask(ctx context.Context, node, upid string, timeout time.Duration) error {
 	if upid == "" {
 		return nil
 	}
-	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	for {
 		var st struct {
 			Status     string `json:"status"`
 			ExitStatus string `json:"exitstatus"`
 		}
-		if err := c.do(ctx, http.MethodGet, "/nodes/"+node+"/tasks/"+upid+"/status", nil, &st); err != nil {
-			return err
+		err := c.do(waitCtx, http.MethodGet, "/nodes/"+node+"/tasks/"+url.PathEscape(upid)+"/status", nil, &st)
+		if err != nil {
+			return fmt.Errorf("узел %s, UPID %s; ожидание прервано, задача могла продолжить работу: %w", node, upid, err)
 		}
 		if st.Status == "stopped" {
 			if st.ExitStatus == "OK" || strings.HasPrefix(st.ExitStatus, "WARNINGS") {
 				return nil
 			}
-			return fmt.Errorf("задача завершилась с ошибкой: %s", st.ExitStatus)
-		}
-		if time.Now().After(deadline) {
-			return errors.New("таймаут ожидания задачи")
+			log, logErr := c.TaskLog(waitCtx, node, upid)
+			if logErr != nil {
+				log = "журнал недоступен: " + logErr.Error()
+			}
+			return &TaskError{Node: node, UPID: upid, Status: st.ExitStatus, Log: c.Redact(log)}
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-waitCtx.Done():
+			return fmt.Errorf("UPID %s: задача может продолжать работу: %w", upid, waitCtx.Err())
 		case <-time.After(time.Second):
 		}
 	}
@@ -182,9 +249,11 @@ func (c *Client) NodeOnline(ctx context.Context, node string) error {
 
 // StorageStatus — доступное/общее место на хранилище узла (в байтах).
 type StorageStatus struct {
-	Avail int64 `json:"avail"`
-	Total int64 `json:"total"`
-	Used  int64 `json:"used"`
+	Avail   int64 `json:"avail"`
+	Total   int64 `json:"total"`
+	Used    int64 `json:"used"`
+	Active  *int  `json:"active"`
+	Enabled *int  `json:"enabled"`
 }
 
 // StorageStatus возвращает состояние хранилища на узле.
@@ -198,11 +267,21 @@ func (c *Client) StorageStatus(ctx context.Context, node, storage string) (Stora
 
 // NextID возвращает свободный VMID.
 func (c *Client) NextID(ctx context.Context) (int, error) {
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
 	var raw json.RawMessage
 	if err := c.do(ctx, http.MethodGet, "/cluster/nextid", nil, &raw); err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(strings.Trim(string(raw), `"`))
+	id, err := strconv.Atoi(strings.Trim(string(raw), `"`))
+	if err != nil {
+		return 0, err
+	}
+	for c.reserved[id] {
+		id++
+	}
+	c.reserved[id] = true
+	return id, nil
 }
 
 // CloneVM клонирует шаблон, возвращает UPID.
@@ -355,12 +434,13 @@ func (c *Client) AgentIPs(ctx context.Context, node string, vmid int) ([]string,
 
 // Member — участник пула.
 type Member struct {
-	Type   string `json:"type"`
-	VMID   int    `json:"vmid"`
-	Node   string `json:"node"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Tags   string `json:"tags"`
+	Type     string  `json:"type"`
+	Template APIBool `json:"template"`
+	VMID     int     `json:"vmid"`
+	Node     string  `json:"node"`
+	Name     string  `json:"name"`
+	Status   string  `json:"status"`
+	Tags     string  `json:"tags"`
 }
 
 // CreatePool создаёт пул.

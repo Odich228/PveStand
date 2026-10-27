@@ -4,7 +4,9 @@ package stand
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,7 +32,11 @@ type Config struct {
 
 	// suffix — служебное поле, не читается из YAML. Проставляется в
 	// Instances() для конкретной копии стенда и добавляется к именам ВМ.
-	suffix string `yaml:"-"`
+	suffix     string   `yaml:"-"`
+	Runtime    *Runtime `yaml:"-"`
+	Source     string   `yaml:"-"`
+	Only       string   `yaml:"-"`
+	RetryClone string   `yaml:"-"`
 }
 
 // Participant — одна копия стенда (участник или команда).
@@ -47,26 +53,40 @@ type Network struct {
 
 // VM — группа одинаковых машин, клонируемых из шаблона.
 type VM struct {
-	Name     string `yaml:"name"`
-	Template int    `yaml:"template"` // VMID шаблона
-	Count    int    `yaml:"count"`    // сколько копий (по умолчанию 1)
-	Cores    int    `yaml:"cores"`
-	Memory   int    `yaml:"memory"` // МБ
-	NICs     []NIC  `yaml:"nics"`
-	Start    bool   `yaml:"start"`
+	Name         string   `yaml:"name"`
+	Template     int      `yaml:"template"` // VMID шаблона
+	Count        int      `yaml:"count"`    // сколько копий (по умолчанию 1)
+	Cores        int      `yaml:"cores"`
+	Memory       int      `yaml:"memory"` // МБ
+	NICs         []NIC    `yaml:"nics"`
+	Start        bool     `yaml:"start"`
+	CPU          string   `yaml:"cpu"`
+	Sockets      int      `yaml:"sockets"`
+	Storage      string   `yaml:"storage"`
+	BootOrder    []string `yaml:"boot_order"`
+	ReplaceNICs  bool     `yaml:"replace_nics"`
+	DependsOn    []string `yaml:"depends_on"`
+	Ready        string   `yaml:"ready"`
+	ReadyAddress string   `yaml:"ready_address"`
+	ReadyTimeout int      `yaml:"ready_timeout"`
 }
 
 // NIC — сетевой адаптер ВМ.
 type NIC struct {
-	Bridge string `yaml:"bridge"`
-	Model  string `yaml:"model"` // по умолчанию virtio
+	Bridge   string `yaml:"bridge"`
+	Model    string `yaml:"model"`
+	VLAN     int    `yaml:"vlan"`
+	Firewall *bool  `yaml:"firewall"`
+	LinkDown *bool  `yaml:"link_down"`
 }
 
 // User — пользователь, получающий роль на пул стенда.
 type User struct {
-	ID       string `yaml:"id"` // student1@pve
-	Password string `yaml:"password"`
-	Role     string `yaml:"role"` // по умолчанию PVEVMUser
+	ID           string `yaml:"id"` // student1@pve
+	Password     string `yaml:"password"`
+	Role         string `yaml:"role"`
+	PasswordEnv  string `yaml:"password_env"`
+	PasswordFile string `yaml:"password_file"` // по умолчанию PVEVMUser
 }
 
 // InstanceName — имя конкретной копии ВМ. suffix (если не пуст) добавляется
@@ -112,7 +132,15 @@ func Load(path string) (*Config, error) {
 	dec.KnownFields(true) // опечатки в ключах = ошибка
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, fmt.Errorf("%s: %w%s", path, err, yamlHint(data, err))
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("%s: допускается ровно один YAML-документ", path)
+	}
+	cfg.Source = path
+	if err := cfg.resolveSecrets(filepath.Dir(path)); err != nil {
+		return nil, err
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -151,6 +179,9 @@ func (c *Config) Validate() error {
 	if c.Name == "" || c.Node == "" || c.Pool == "" {
 		return fmt.Errorf("поля name, node и pool обязательны")
 	}
+	if !idRe.MatchString(c.Node) {
+		return fmt.Errorf("node: недопустимое имя узла")
+	}
 	if !idRe.MatchString(c.Name) {
 		return fmt.Errorf("name %q: допустимы только латиница, цифры, «-» и «_» (из имени строится тег стенда, по которому ВМ находятся при удалении)", c.Name)
 	}
@@ -178,6 +209,34 @@ func (c *Config) Validate() error {
 		if v.Template <= 0 {
 			return fmt.Errorf("ВМ %q: не указан template (VMID шаблона)", v.Name)
 		}
+		if v.Cores < 0 || v.Memory < 0 || v.Sockets < 0 || v.Cores > 1024 || v.Sockets > 64 {
+			return fmt.Errorf("ВМ %q: cores 0..1024, sockets 0..64, memory >= 0 (0 = наследовать)", v.Name)
+		}
+		if v.CPU != "" && !regexp.MustCompile(`^[A-Za-z0-9_.-]+$`).MatchString(v.CPU) {
+			return fmt.Errorf("ВМ %q: недопустимая модель CPU", v.Name)
+		}
+		if v.Storage != "" && (!idRe.MatchString(v.Storage) || !c.FullClone) {
+			return fmt.Errorf("ВМ %q: storage требует full_clone: true и корректное имя хранилища", v.Name)
+		}
+		if v.Ready != "" && v.Ready != "agent" && v.Ready != "tcp" {
+			return fmt.Errorf("ВМ %q: ready должен быть agent или tcp", v.Name)
+		}
+		if v.Ready != "" && !v.Start {
+			return fmt.Errorf("ВМ %q: ready требует start: true", v.Name)
+		}
+		if v.ReadyTimeout < 0 || v.ReadyTimeout > 86400 {
+			return fmt.Errorf("ВМ %q: ready_timeout 0..86400 секунд", v.Name)
+		}
+		if v.Ready == "tcp" {
+			if err := validAddress(v.ReadyAddress); err != nil {
+				return fmt.Errorf("ВМ %q: %w", v.Name, err)
+			}
+		}
+		for _, device := range v.BootOrder {
+			if !regexp.MustCompile(`^(scsi|ide|sata|virtio|net)[0-9]+$`).MatchString(device) {
+				return fmt.Errorf("ВМ %q: неверное устройство boot_order %q", v.Name, device)
+			}
+		}
 		if v.Count < 1 {
 			return fmt.Errorf("ВМ %q: count должен быть >= 1", v.Name)
 		}
@@ -189,6 +248,9 @@ func (c *Config) Validate() error {
 			names[n] = true
 		}
 		for _, nic := range v.NICs {
+			if nic.VLAN < 0 || nic.VLAN > 4094 {
+				return fmt.Errorf("ВМ %q: vlan должен быть 1..4094 (0 = без тега)", v.Name)
+			}
 			if nic.Bridge == "" {
 				return fmt.Errorf("ВМ %q: у сетевого адаптера не указан bridge", v.Name)
 			}
@@ -199,6 +261,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("ВМ %q: недопустимая модель сетевого адаптера %q", v.Name, nic.Model)
 			}
 		}
+	}
+	if err := validateDependencies(c.VMs); err != nil {
+		return err
 	}
 	if err := validateUsers(c.Users); err != nil {
 		return err
@@ -218,6 +283,25 @@ func (c *Config) Validate() error {
 	}
 
 	// Проверки, зависящие от суффиксов участников: считаем по реальным копиям.
+	internalBridges := map[string]bool{}
+	externalBridges := map[string]bool{}
+	for _, n := range c.Networks {
+		internalBridges[n.Bridge] = true
+	}
+	for _, v := range c.VMs {
+		for _, nic := range v.NICs {
+			if !internalBridges[nic.Bridge] {
+				externalBridges[nic.Bridge] = true
+			}
+		}
+	}
+	for _, inst := range c.Instances() {
+		for _, n := range inst.Networks {
+			if externalBridges[n.Bridge] {
+				return fmt.Errorf("сеть участника %s пересекается с внешней сетью %s", inst.suffix, n.Bridge)
+			}
+		}
+	}
 	owners := map[string]string{} // user id -> участник
 	for _, inst := range c.Instances() {
 		who := inst.suffix
@@ -261,8 +345,14 @@ func validateUsers(users []User) error {
 }
 
 func validateUser(u User) error {
-	if len(u.ID) < 3 || !strings.Contains(u.ID, "@") {
+	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*@[A-Za-z][A-Za-z0-9_.-]*$`).MatchString(u.ID) {
 		return fmt.Errorf("пользователь %q: нужен формат имя@realm, например student1@pve", u.ID)
+	}
+	if !regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`).MatchString(u.Role) {
+		return fmt.Errorf("пользователь %s: недопустимое имя роли", u.ID)
+	}
+	if len(u.Password) > 64 {
+		return fmt.Errorf("пользователь %s: пароль длиннее 64 символов", u.ID)
 	}
 	if len(u.Password) < 8 {
 		return fmt.Errorf("пользователь %q: пароль короче 8 символов", u.ID)
@@ -397,7 +487,7 @@ func (c *Config) ExpectedVMNames() map[string]bool {
 
 // Tag — метка, которой помечаются ВМ этого стенда (проставляется в
 // SetVMConfig при развёртывании). Используется при безопасном удалении как
-// второй, независимый от имени признак «это наша ВМ».
+// удобная метка для поиска. Для изменения и удаления нужны журнал и description владельца.
 func (c *Config) Tag() string {
 	return "pvestand-" + tagRe.ReplaceAllString(strings.ToLower(c.Name), "-")
 }

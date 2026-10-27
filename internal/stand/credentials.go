@@ -38,7 +38,10 @@ func WriteCredentialsFile(path string, instances []*Config) error {
 		return err
 	}
 	// Chmod может не поддерживаться (например, на Windows) — это не фатально.
-	_ = f.Chmod(0o600)
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
 	if _, err := f.WriteString(CredentialsTable(instances)); err != nil {
 		f.Close()
 		return err

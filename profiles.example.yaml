@@ -1,0 +1,11 @@
+profiles:
+  lab:
+    host: pve.example.test:8006
+    insecure: false
+    token_env: PVE_LAB_TOKEN
+    state_dir: .pvestand-lab
+  isolated-test:
+    host: 192.0.2.10
+    insecure: true
+    token_file: ./pve.secret
+    state_dir: .pvestand-test

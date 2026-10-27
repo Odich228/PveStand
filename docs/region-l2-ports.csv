@@ -1,0 +1,17 @@
+bridge,device_a,nic_a,device_b,nic_b,purpose
+vmbr0,GW-CORE,net0,Internet,external,existing external uplink
+vmbr101,GW-CORE,net1,GW-1,net0,point-to-point
+vmbr102,GW-CORE,net2,GW-2,net0,point-to-point
+vmbr103,GW-CORE,net3,GW-3,net0,point-to-point
+vmbr104,GW-1,net1,COD-GW,net0,point-to-point
+vmbr105,COD-GW,net1,COD-SW-CORE,net0,point-to-point
+vmbr106,COD-SW-CORE,net1,COD-ADMIN,net0,point-to-point
+vmbr107,COD-SW-CORE,net2,DATA,net0,point-to-point
+vmbr108,COD-SW-CORE,net3,COD-SRV,net0,point-to-point
+vmbr109,COD-SW-CORE,net4,PUB,net0,point-to-point
+vmbr110,COD-SW-CORE,net5,NODE,net0,point-to-point
+vmbr111,GW-2,net1,ZSPD-SW,net0,point-to-point
+vmbr112,ZSPD-SW,net1,ZSPD-GW,net0,point-to-point
+vmbr113,GW-3,net1,PROVIDER-SW,net0,point-to-point
+vmbr114,PROVIDER-SW,net1,PROVIDER-GW,net0,LACP member
+vmbr115,PROVIDER-SW,net2,PROVIDER-GW,net1,LACP member
