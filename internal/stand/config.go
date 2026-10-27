@@ -28,21 +28,25 @@ type Config struct {
 	// каждого участника/команду: свой пул (с суффиксом id), свои ВМ (тоже с
 	// суффиксом в имени), свои бриджи (со сдвинутым номером) и свои
 	// пользователи. См. Config.Instances().
-	Participants []Participant `yaml:"participants"`
+	Participants []Participant           `yaml:"participants"`
+	Nodes        map[string]NodeSettings `yaml:"nodes"`
 
 	// suffix — служебное поле, не читается из YAML. Проставляется в
 	// Instances() для конкретной копии стенда и добавляется к именам ВМ.
-	suffix     string   `yaml:"-"`
-	Runtime    *Runtime `yaml:"-"`
-	Source     string   `yaml:"-"`
-	Only       string   `yaml:"-"`
-	RetryClone string   `yaml:"-"`
+	suffix          string   `yaml:"-"`
+	Runtime         *Runtime `yaml:"-"`
+	Source          string   `yaml:"-"`
+	Only            string   `yaml:"-"`
+	RetryClone      string   `yaml:"-"`
+	ParticipantOnly string   `yaml:"-"`
 }
 
 // Participant — одна копия стенда (участник или команда).
 type Participant struct {
-	ID    string `yaml:"id"`    // используется как суффикс пула/ВМ, только латиница/цифры/дефис
-	Users []User `yaml:"users"` // если не заданы — используются пользователи верхнего уровня
+	Node       string `yaml:"node"`
+	BridgeBase int    `yaml:"bridge_base"`
+	ID         string `yaml:"id"`    // используется как суффикс пула/ВМ, только латиница/цифры/дефис
+	Users      []User `yaml:"users"` // если не заданы — используются пользователи верхнего уровня
 }
 
 // Network — изолированный Linux-бридж на узле.
@@ -123,7 +127,16 @@ var (
 )
 
 // Load читает и проверяет YAML-файл стенда.
-func Load(path string) (*Config, error) {
+func Load(path string) (*Config, error) { return loadConfig(path, true, "") }
+
+// LoadStructure validates topology without reading credentials.
+func LoadStructure(path string) (*Config, error) { return loadConfig(path, false, "") }
+
+func LoadForParticipant(path, participant string) (*Config, error) {
+	return loadConfig(path, true, participant)
+}
+
+func loadConfig(path string, secrets bool, participant string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -138,8 +151,11 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&extra); err != io.EOF {
 		return nil, fmt.Errorf("%s: допускается ровно один YAML-документ", path)
 	}
+	if err := cfg.SelectParticipant(participant); err != nil {
+		return nil, err
+	}
 	cfg.Source = path
-	if err := cfg.resolveSecrets(filepath.Dir(path)); err != nil {
+	if err := cfg.resolveSecretRefs(filepath.Dir(path), secrets); err != nil {
 		return nil, err
 	}
 	cfg.applyDefaults()
@@ -270,6 +286,9 @@ func (c *Config) Validate() error {
 	}
 	pids := map[string]bool{}
 	for _, p := range c.Participants {
+		if p.ID == "all" {
+			return fmt.Errorf("id участника all зарезервирован для выбора всех стендов")
+		}
 		if !nameRe.MatchString(p.ID) {
 			return fmt.Errorf("участник %q: id должен состоять из латиницы, цифр и дефисов", p.ID)
 		}
@@ -280,6 +299,10 @@ func (c *Config) Validate() error {
 		if err := validateUsers(p.Users); err != nil {
 			return fmt.Errorf("участник %q: %w", p.ID, err)
 		}
+	}
+
+	if err := c.validatePlacements(); err != nil {
+		return err
 	}
 
 	// Проверки, зависящие от суффиксов участников: считаем по реальным копиям.
@@ -295,7 +318,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	for _, inst := range c.Instances() {
+	for _, inst := range c.allInstances() {
 		for _, n := range inst.Networks {
 			if externalBridges[n.Bridge] {
 				return fmt.Errorf("сеть участника %s пересекается с внешней сетью %s", inst.suffix, n.Bridge)
@@ -303,7 +326,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	owners := map[string]string{} // user id -> участник
-	for _, inst := range c.Instances() {
+	for _, inst := range c.allInstances() {
 		who := inst.suffix
 		for _, n := range inst.Networks {
 			if !bridgeRe.MatchString(n.Bridge) {
@@ -354,7 +377,7 @@ func validateUser(u User) error {
 	if len(u.Password) > 64 {
 		return fmt.Errorf("пользователь %s: пароль длиннее 64 символов", u.ID)
 	}
-	if len(u.Password) < 8 {
+	if len(u.Password) < 8 && !(u.Password == "" && (u.PasswordEnv != "" || u.PasswordFile != "")) {
 		return fmt.Errorf("пользователь %q: пароль короче 8 символов", u.ID)
 	}
 	return nil
@@ -430,9 +453,24 @@ func mapBridge(name string, idx, stride int) string {
 //     же пользователей).
 //
 // Копии независимы: срезы Networks и VMs не разделяются с исходным конфигом.
-func (c *Config) Instances() []*Config {
+func (c *Config) allInstances() []*Config {
 	if len(c.Participants) == 0 {
-		return []*Config{c}
+		if len(c.Nodes) == 0 {
+			return []*Config{c}
+		}
+		cp := *c
+		cp.VMs = append([]VM(nil), c.VMs...)
+		settings := c.Nodes[c.Node]
+		cp.Nodes = nil
+		for i := range cp.VMs {
+			if template, ok := settings.Templates[cp.VMs[i].Template]; ok {
+				cp.VMs[i].Template = template
+			}
+			if settings.Storage != "" {
+				cp.VMs[i].Storage = settings.Storage
+			}
+		}
+		return []*Config{&cp}
 	}
 	stride := c.bridgeStride()
 	out := make([]*Config, 0, len(c.Participants))
@@ -442,11 +480,21 @@ func (c *Config) Instances() []*Config {
 		cp.Name = c.Name + "-" + p.ID
 		cp.suffix = p.ID
 		cp.Participants = nil
+		if p.Node != "" {
+			cp.Node = p.Node
+		}
+		cp.ParticipantOnly = ""
+		settings := c.Nodes[cp.Node]
+		cp.Nodes = nil
 
 		bmap := map[string]string{}
 		cp.Networks = make([]Network, len(c.Networks))
 		for j, n := range c.Networks {
 			nb := mapBridge(n.Bridge, idx, stride)
+			if p.BridgeBase > 0 {
+				value, _ := bridgeNum(n.Bridge)
+				nb = fmt.Sprintf("vmbr%d", p.BridgeBase+value-c.bridgeMin())
+			}
 			bmap[n.Bridge] = nb
 			n.Bridge = nb
 			n.Comment = strings.TrimSpace(n.Comment + " " + p.ID)
@@ -454,6 +502,12 @@ func (c *Config) Instances() []*Config {
 		}
 		cp.VMs = make([]VM, len(c.VMs))
 		for j, v := range c.VMs {
+			if template, ok := settings.Templates[v.Template]; ok {
+				v.Template = template
+			}
+			if settings.Storage != "" {
+				v.Storage = settings.Storage
+			}
 			nics := make([]NIC, len(v.NICs))
 			for k, nic := range v.NICs {
 				if nb, ok := bmap[nic.Bridge]; ok {

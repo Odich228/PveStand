@@ -10,20 +10,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"pvestand/internal/pve"
 	"pvestand/internal/stand"
-)
-
-// ---------- Стили ----------
-
-var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	selStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	okStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	errStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 )
 
 // ---------- Состояния ----------
@@ -40,6 +29,7 @@ const (
 	stRun
 	stDone
 	stStatus
+	stParticipantPick
 )
 
 var menu = []struct{ Title, Action string }{
@@ -131,27 +121,39 @@ type model struct {
 	total int
 	err   error
 
-	cancel    context.CancelFunc
-	cancelled bool
-	events    chan stand.Event
-	height    int
+	cancel        context.CancelFunc
+	cancelled     bool
+	events        chan stand.Event
+	height        int
+	width         int
+	splash        bool
+	splashStart   time.Time
+	splashElapsed time.Duration
+	motion        bool
+	visualPending bool
+	visualFrame   int
+	revealFrame   int
+	doneFrame     int
 
 	confirm *confirmData
 
 	statusRows []statusRow
 	statusErr  string
 
-	credTable  string
-	rows       map[string]stand.Event
-	rowStarted map[string]time.Time
-	rowCursor  int
-	logOffset  int
-	showLog    bool
-	failedOnly bool
-	only       string
+	credTable         string
+	rows              map[string]stand.Event
+	rowStarted        map[string]time.Time
+	rowCursor         int
+	logOffset         int
+	showLog           bool
+	failedOnly        bool
+	participant       string
+	participantErr    string
+	participantCursor int
+	only              string
 }
 
-func newModel(cfgPath string, cfgPathSet bool, host, token string, insecure bool, parallel int, lf *os.File) *model {
+func newModel(cfgPath string, cfgPathSet bool, host, token string, insecure bool, parallel int, lf *os.File, selected ...string) *model {
 	m := &model{
 		cfgPath:      cfgPath,
 		host:         host,
@@ -160,11 +162,17 @@ func newModel(cfgPath string, cfgPathSet bool, host, token string, insecure bool
 		parallel:     parallel,
 		logFile:      lf,
 		height:       24,
+		width:        80,
+		splash:       true,
+		motion:       true,
 		connInputs:   [2]string{host, token},
 		connInsecure: insecure,
 	}
+	if len(selected) > 0 {
+		m.participant = selected[0]
+	}
 	if cfgPathSet {
-		if cfg, err := stand.Load(cfgPath); err == nil {
+		if cfg, err := stand.LoadForParticipant(cfgPath, m.participant); err == nil {
 			m.cfg = cfg
 			if host != "" && token != "" {
 				if cli, err := pve.New(host, token, insecure); err == nil {
@@ -184,7 +192,13 @@ func newModel(cfgPath string, cfgPathSet bool, host, token string, insecure bool
 	return m
 }
 
-func (m *model) Init() tea.Cmd { return nil }
+func (m *model) Init() tea.Cmd {
+	if m.splash {
+		m.splashStart = time.Now()
+		return splashTickCmd()
+	}
+	return m.queueVisualTick()
+}
 
 // ---------- Переходы между экранами ----------
 
@@ -211,8 +225,13 @@ func scanYAMLFiles() ([]string, string) {
 }
 
 func (m *model) loadConfigAndProceed() (tea.Model, tea.Cmd) {
-	cfg, err := stand.Load(m.cfgPath)
+	cfg, err := stand.LoadForParticipant(m.cfgPath, m.participant)
 	if err != nil {
+		m.fileErr = err.Error()
+		m.st = stFilePick
+		return m, nil
+	}
+	if err := cfg.SelectParticipant(m.participant); err != nil {
 		m.fileErr = err.Error()
 		m.st = stFilePick
 		return m, nil
@@ -260,7 +279,7 @@ func (m *model) cmdPreflight() tea.Cmd {
 	cfg, cli := m.cfg, m.cli
 	copies := len(cfg.Instances())
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		return preflightMsg{report: stand.Preflight(ctx, cli, cfg, copies)}
 	}
@@ -269,7 +288,7 @@ func (m *model) cmdPreflight() tea.Cmd {
 func (m *model) cmdDestroyPreview() tea.Cmd {
 	cfg, cli := m.cfg, m.cli
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		if err := stand.Bind(cli, cfg); err != nil {
 			return destroyPreviewMsg{err: err}
@@ -293,7 +312,7 @@ func (m *model) cmdDestroyPreview() tea.Cmd {
 func (m *model) cmdStatus() tea.Cmd {
 	cfg, cli := m.cfg, m.cli
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		var rows []statusRow
 		for _, inst := range cfg.Instances() {
@@ -361,7 +380,7 @@ func (m *model) start(action string) tea.Cmd {
 func (m *model) cmdPlan() tea.Cmd {
 	cfg, cli := m.cfg, m.cli
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		lines, err := stand.LivePlan(ctx, cli, cfg)
 		return planMsg{lines, err}

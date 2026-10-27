@@ -35,17 +35,22 @@ func main() {
 	token := flag.String("token", "", "API-токен (предпочтительно PVE_TOKEN или -token-file)")
 	tokenFile := flag.String("token-file", "", "файл API-токена с правами 0600")
 	insecure := flag.Bool("insecure", false, "не проверять TLS-сертификат")
-	run := flag.String("run", "", "validate | doctor | plan | deploy | destroy | snapshot | reset | status | tasklog")
+	run := flag.String("run", "", "validate | doctor | plan | deploy | destroy | snapshot | reset | status | tasklog | l2manifest")
 	parallel := flag.Int("parallel", stand.DefaultParallelism, "число одновременно обрабатываемых ВМ")
 	logPath := flag.String("log", "", "файл журнала, в TUI создаётся автоматически")
 	profile := flag.String("profile", "", "имя профиля подключения")
 	profiles := flag.String("profiles", "profiles.yaml", "файл профилей")
 	stateDir := flag.String("state-dir", ".pvestand", "каталог журнала состояния; сохраняйте между запусками")
+	participant := flag.String("participant", "", "участник A0 и т.п.; по умолчанию все стенды")
+	manifestOut := flag.String("out", "region-l2.manifest.json", "выходной JSON для -run l2manifest")
+	taskNode := flag.String("task-node", "", "узел задачи для -run tasklog; иначе узел выбранного стенда")
 	retryClone := flag.String("retry-clone", "", "явно повторить неподтверждённый clone выбранной ВМ в тот же сохранённый VMID")
 	only := flag.String("only", "", "для deploy: имя ВМ или группы; зависимости включаются автоматически")
 	credentials := flag.String("credentials", "", "после deploy сохранить пароли в файл 0600")
 	upid := flag.String("upid", "", "UPID задачи для tasklog")
 	offline := flag.Bool("offline", false, "статический plan без подключения к Proxmox")
+	noAnimation := flag.Bool("no-animation", false, "отключить анимации TUI и стартовую заставку")
+	noSplash := flag.Bool("no-splash", false, "пропустить анимированный стартовый экран TUI")
 	version := flag.Bool("version", false, "версия программы")
 	flag.Parse()
 	if *version {
@@ -58,15 +63,25 @@ func main() {
 		fatal(fmt.Errorf("parallel должен быть >= 1"))
 	}
 	stand.DefaultStateDir = *stateDir
-	if *run == "validate" {
-		cfg, err := stand.Load(*cfgPath)
+	if *run == "validate" || *run == "l2manifest" {
+		cfg, err := stand.LoadStructure(*cfgPath)
 		if err != nil {
 			fatal(err)
 		}
-		fmt.Printf("Конфиг корректен: %s; копий %d\n", cfg.Name, len(cfg.Instances()))
+		if err := cfg.SelectParticipant(*participant); err != nil {
+			fatal(err)
+		}
+		if *run == "l2manifest" {
+			if err := stand.WriteL2Manifest(*manifestOut, cfg); err != nil {
+				fatal(err)
+			}
+			fmt.Println("Карта L2 сохранена: " + *manifestOut)
+			return
+		}
+		fmt.Printf("Структура конфига корректна: %s; копий %d\n", cfg.Name, len(cfg.Instances()))
 		return
 	}
-	if *run != "" && !strings.Contains("|doctor|plan|deploy|destroy|snapshot|reset|status|tasklog|", "|"+*run+"|") {
+	if *run != "" && !strings.Contains("|doctor|plan|deploy|destroy|snapshot|reset|status|tasklog|l2manifest|", "|"+*run+"|") {
 		fatal(fmt.Errorf("неизвестное действие %q", *run))
 	}
 	if *retryClone != "" && *run != "deploy" {
@@ -79,9 +94,15 @@ func main() {
 		fatal(fmt.Errorf("-offline требует -run plan"))
 	}
 	if *offline {
-		cfg, err := stand.Load(*cfgPath)
+		cfg, err := stand.LoadStructure(*cfgPath)
 		if err != nil {
 			fatal(err)
+		}
+		if err := cfg.SelectParticipant(*participant); err != nil {
+			fatal(err)
+		}
+		for _, line := range cfg.InstanceSummary() {
+			fmt.Println(line)
 		}
 		for _, inst := range cfg.Instances() {
 			for _, line := range stand.DeploySteps(nil, inst).Describe() {
@@ -126,8 +147,11 @@ func main() {
 		*token = os.Getenv("PVE_TOKEN")
 	}
 	if *run != "" {
-		cfg, err := stand.Load(*cfgPath)
+		cfg, err := stand.LoadForParticipant(*cfgPath, *participant)
 		if err != nil {
+			fatal(err)
+		}
+		if err := cfg.SelectParticipant(*participant); err != nil {
 			fatal(err)
 		}
 		cfg.Only = *only
@@ -181,7 +205,16 @@ func main() {
 			if *upid == "" {
 				fatal(fmt.Errorf("укажите -upid"))
 			}
-			s, err := cli.TaskLog(ctx, cfg.Node, *upid)
+			node := *taskNode
+			if node == "" {
+				instances := cfg.Instances()
+				if len(instances) == 1 {
+					node = instances[0].Node
+				} else {
+					fatal(fmt.Errorf("для tasklog выберите -participant или задайте -task-node"))
+				}
+			}
+			s, err := cli.TaskLog(ctx, node, *upid)
 			if err != nil {
 				fatal(err)
 			}
@@ -217,7 +250,15 @@ func main() {
 		fatal(err)
 	}
 	defer lf.Close()
-	m := newModel(*cfgPath, set["c"], *host, *token, *insecure, *parallel, lf)
+	m := newModel(*cfgPath, set["c"], *host, *token, *insecure, *parallel, lf, *participant)
+	m.splash = !*noSplash && !*noAnimation
+	m.motion = !*noAnimation
+	m.participant = *participant
+	if m.cfg != nil {
+		if err := m.cfg.SelectParticipant(*participant); err != nil {
+			fatal(err)
+		}
+	}
 	if _, err = tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fatal(err)
 	}

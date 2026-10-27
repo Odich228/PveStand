@@ -6,6 +6,7 @@ Re-run after restarting VMs, because TAP ports are recreated.
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -36,26 +37,29 @@ def config(path):
     return values
 
 
-def inspect(config_dir=CONFIG_DIR, sysfs=SYSFS):
+def inspect(config_dir=CONFIG_DIR, sysfs=SYSFS, *, ports=None, links=None, scope=None, masks=None):
+    ports = PORTS if ports is None else ports
+    links = LINKS if links is None else links
+    scope = SCOPE if scope is None else scope
     found = {}
     owners = set()
     for path in config_dir.glob("*.conf"):
         cfg = config(path)
         name = cfg.get("name")
-        if name not in PORTS or cfg.get("template") == "1":
+        if name not in ports or cfg.get("template") == "1":
             continue
         if name in found:
             raise ValueError(f"Несколько обычных ВМ с именем {name}: проверьте VMID")
-        if not re.fullmatch(r"pvestand:[0-9a-f]{32}:" + SCOPE, unquote(cfg.get("description", ""))):
+        if not re.fullmatch(r"pvestand:[0-9a-f]{32}:" + scope, unquote(cfg.get("description", ""))):
             raise ValueError(f"{name}: нет метки владельца данного стенда; настройки не изменены")
         owners.add(unquote(cfg["description"]))
         found[name] = (int(path.stem), cfg)
-    missing = sorted(set(PORTS) - set(found))
+    missing = sorted(set(ports) - set(found))
     if missing:
         raise ValueError("Сначала разверните все ВМ: отсутствуют " + ", ".join(missing))
     if len(owners) != 1:
         raise ValueError("ВМ принадлежат разным журналам; настройки не изменены")
-    for name, expected in PORTS.items():
+    for name, expected in ports.items():
         _, cfg = found[name]
         actual_keys = {k for k in cfg if re.fullmatch(r"net[0-9]+", k)}
         if actual_keys != set(expected):
@@ -69,7 +73,7 @@ def inspect(config_dir=CONFIG_DIR, sysfs=SYSFS):
             if p.get("firewall", "0") != "0" or p.get("link_down", "0") != "0":
                 raise ValueError(f"{name} {key}: требуется firewall=0 и link_down=0")
     changes = []
-    for bridge, endpoints in LINKS.items():
+    for bridge, endpoints in links.items():
         br = sysfs / bridge
         if (br / "bridge/vlan_filtering").read_text().strip() != "0":
             raise ValueError(f"{bridge}: нужен vlan_filtering=0 для прозрачного учебного кабеля")
@@ -79,7 +83,7 @@ def inspect(config_dir=CONFIG_DIR, sysfs=SYSFS):
         actual = {p.name for p in (br / "brif").iterdir()}
         if actual != expected:
             raise ValueError(f"{bridge}: ожидаются ровно {sorted(expected)}, подключены {sorted(actual)}; проверьте запуск ВМ и firewall")
-        mask = 0x4004 if bridge in {"vmbr114", "vmbr115"} else 0x4000
+        mask = masks[bridge] if masks is not None else (0x4004 if bridge in {"vmbr114", "vmbr115"} else 0x4000)
         for port in sorted(expected):
             path = sysfs / port / "brport/group_fwd_mask"
             old = int(path.read_text().strip(), 0)
@@ -109,16 +113,64 @@ def apply_changes(changes):
         raise ValueError(f"Не удалось применить настройки: {exc}{detail}") from exc
 
 
+def inspect_manifest(path, node, participant=None, config_dir=CONFIG_DIR, sysfs=SYSFS):
+    manifest = json.loads(Path(path).read_text())
+    if manifest.get("version") != 1 or not isinstance(manifest.get("nodes"), dict):
+        raise ValueError("Неподдерживаемый формат карты L2")
+    stands = manifest["nodes"].get(node, [])
+    if participant is not None:
+        stands = [stand for stand in stands if stand.get("participant") == participant]
+    if not stands:
+        raise ValueError("В карте L2 нет выбранных стендов на узле " + node)
+    changes, seen_bridges, seen_names = [], set(), set()
+    for stand in stands:
+        scope, ports, raw_links, masks = (stand[key] for key in ("scope", "ports", "links", "masks"))
+        if not re.fullmatch(r"[0-9a-f]{16}", scope) or not ports or not raw_links:
+            raise ValueError("Пустая/неверная схема стенда")
+        links = {}
+        expected_links = {}
+        for name, adapters in ports.items():
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", name) or name in seen_names:
+                raise ValueError("Повторяющееся/неверное имя ВМ в карте L2")
+            seen_names.add(name)
+            for adapter, bridge in adapters.items():
+                if not re.fullmatch(r"net[0-9]+", adapter) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", bridge):
+                    raise ValueError("Неверный порт или bridge в карте L2")
+                expected_links.setdefault(bridge, set()).add((name, int(adapter[3:])))
+        if set(raw_links) != set(masks):
+            raise ValueError("Наборы мостов и масок не совпадают")
+        for bridge, endpoints in raw_links.items():
+            if not re.fullmatch(r"vmbr[0-9]{1,4}", bridge) or bridge in seen_bridges or masks[bridge] not in (0x4000, 0x4004):
+                raise ValueError("Повторяющийся/неверный bridge или маска в карте L2")
+            seen_bridges.add(bridge)
+            pairs = [(end["vm"], end["nic"]) for end in endpoints]
+            if any(not isinstance(nic, int) or nic < 0 for _, nic in pairs):
+                raise ValueError("Неверный индекс адаптера")
+            if len(pairs) != 2 or pairs[0][0] == pairs[1][0] or set(pairs) != expected_links.get(bridge):
+                raise ValueError("Соединения и порты не совпадают в карте L2")
+            links[bridge] = pairs
+        # Every selected stand is checked before the caller writes any mask.
+        changes.extend(inspect(config_dir, sysfs, ports=ports, links=links, scope=scope, masks=masks))
+    return changes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="проверить схему и разрешить LLDP/LACP на TAP-портах")
     mode.add_argument("--check", action="store_true", help="только проверить (по умолчанию)")
+    parser.add_argument("--manifest", help="JSON из pvestand -run l2manifest")
+    parser.add_argument("--node", default=os.uname().nodename.split(".")[0], help="имя текущего узла в карте")
+    parser.add_argument("--participant", help="проверить/настроить только один стенд, например A0")
     args = parser.parse_args()
+    if args.participant and not args.manifest:
+        parser.error("--participant требует --manifest")
+    if args.apply and args.node != os.uname().nodename.split(".")[0]:
+        parser.error("--node должен совпадать с текущим узлом")
     if args.apply and os.geteuid() != 0:
-        parser.error("--apply требуется запускать от root на SF-4")
+        parser.error("--apply требуется запускать от root на целевом узле")
     try:
-        changes = inspect()
+        changes = inspect_manifest(args.manifest, args.node, args.participant) if args.manifest else inspect()
         pending = sum(old != new for _, old, new in changes)
         if args.apply:
             apply_changes(changes)
@@ -126,12 +178,12 @@ def main():
             actual = int(path.read_text().strip(), 0)
             print(f"{path.parent.parent.name}: {actual:#06x}, требуется {new:#06x}")
         if args.apply or pending == 0:
-            print("Проверено: 15 ВМ, 15 кабелей, LLDP разрешён на внутренних портах, LACP разрешён на vmbr114/vmbr115.")
+            print("Проверено: схема и маски LLDP/LACP выбранных стендов соответствуют карте L2.")
             print("Настройку VLAN и самого LACP выполняют конкурсанты в гостевых устройствах.")
             return 0
         print(f"Нужна настройка {pending} TAP-портов. Повторите с --apply.")
         return 2
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         print("Ошибка: " + str(exc), file=sys.stderr)
         return 1
 

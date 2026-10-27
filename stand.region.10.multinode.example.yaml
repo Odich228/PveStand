@@ -1,0 +1,436 @@
+# 10 независимых стендов A0–A9. PveStand >= 2026.10.27.5.
+# 150 ВМ, 640 ГиБ RAM для гостей; doctor проверяет фактические ресурсы.
+# VLAN/IP/LACP внутри гостевых устройств настраивают конкурсанты.
+# Пароль задайте через REGION_COMPETITOR_PASSWORD; в YAML секретов нет.
+# Пример распределения 5+5; объём памяти на каждом узле должен соответствовать плану.
+name: region-batch
+node: SF-4
+pool: region
+full_clone: false
+
+# Каждый внутренний bridge соединяет ровно два адаптера.
+# На Proxmox внутренние bridges должны иметь vlan_filtering=0.
+networks:
+  - bridge: vmbr101
+    comment: "GW-CORE <-> GW-1"
+  - bridge: vmbr102
+    comment: "GW-CORE <-> GW-2"
+  - bridge: vmbr103
+    comment: "GW-CORE <-> GW-3"
+  - bridge: vmbr104
+    comment: "GW-1 <-> COD-GW"
+  - bridge: vmbr105
+    comment: "COD-GW <-> COD-SW-CORE"
+  - bridge: vmbr106
+    comment: "COD-SW-CORE <-> COD-ADMIN"
+  - bridge: vmbr107
+    comment: "COD-SW-CORE <-> DATA"
+  - bridge: vmbr108
+    comment: "COD-SW-CORE <-> COD-SRV"
+  - bridge: vmbr109
+    comment: "COD-SW-CORE <-> PUB"
+  - bridge: vmbr110
+    comment: "COD-SW-CORE <-> NODE"
+  - bridge: vmbr111
+    comment: "GW-2 <-> ZSPD-SW"
+  - bridge: vmbr112
+    comment: "ZSPD-SW <-> ZSPD-GW"
+  - bridge: vmbr113
+    comment: "GW-3 <-> PROVIDER-SW"
+  - bridge: vmbr114
+    comment: "PROVIDER-SW <-> PROVIDER-GW; отдельная линия будущего LACP"
+  - bridge: vmbr115
+    comment: "PROVIDER-SW <-> PROVIDER-GW; отдельная линия будущего LACP"
+
+vms:
+  - name: GW-CORE
+    template: 1003
+    cores: 2
+    sockets: 1
+    memory: 1024
+    replace_nics: true
+    nics:
+      # net0 -> Internet: существующий внешний bridge
+      - bridge: vmbr0
+        model: virtio
+        firewall: false
+        link_down: false
+      # net1 -> GW-1 net0
+      - bridge: vmbr101
+        model: virtio
+        firewall: false
+        link_down: false
+      # net2 -> GW-2 net0
+      - bridge: vmbr102
+        model: virtio
+        firewall: false
+        link_down: false
+      # net3 -> GW-3 net0
+      - bridge: vmbr103
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: GW-1
+    template: 1001
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [GW-CORE]
+    nics:
+      # net0 -> GW-CORE net1
+      - bridge: vmbr101
+        model: e1000
+        firewall: false
+        link_down: false
+      # net1 -> COD-GW net0
+      - bridge: vmbr104
+        model: e1000
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: GW-2
+    template: 1001
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [GW-CORE]
+    nics:
+      # net0 -> GW-CORE net2
+      - bridge: vmbr102
+        model: e1000
+        firewall: false
+        link_down: false
+      # net1 -> ZSPD-SW net0
+      - bridge: vmbr111
+        model: e1000
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: GW-3
+    template: 1001
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [GW-CORE]
+    nics:
+      # net0 -> GW-CORE net3
+      - bridge: vmbr103
+        model: e1000
+        firewall: false
+        link_down: false
+      # net1 -> PROVIDER-SW net0
+      - bridge: vmbr113
+        model: e1000
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: PROVIDER-SW
+    template: 1004
+    cores: 1
+    sockets: 1
+    memory: 1024
+    replace_nics: true
+    depends_on: [GW-3]
+    nics:
+      # net0 -> GW-3 net1
+      - bridge: vmbr113
+        model: virtio
+        firewall: false
+        link_down: false
+      # net1 -> PROVIDER-GW net0
+      - bridge: vmbr114
+        model: virtio
+        firewall: false
+        link_down: false
+      # net2 -> PROVIDER-GW net1
+      - bridge: vmbr115
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: PROVIDER-GW
+    template: 1001
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [PROVIDER-SW]
+    nics:
+      # net0 -> PROVIDER-SW net1
+      - bridge: vmbr114
+        model: e1000
+        firewall: false
+        link_down: false
+      # net1 -> PROVIDER-SW net2
+      - bridge: vmbr115
+        model: e1000
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: ZSPD-SW
+    template: 1005
+    cores: 1
+    sockets: 1
+    memory: 1024
+    replace_nics: true
+    depends_on: [GW-2]
+    nics:
+      # net0 -> GW-2 net1
+      - bridge: vmbr111
+        model: virtio
+        firewall: false
+        link_down: false
+      # net1 -> ZSPD-GW net0
+      - bridge: vmbr112
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: ZSPD-GW
+    template: 1004
+    cores: 4
+    sockets: 1
+    memory: 16384
+    replace_nics: true
+    depends_on: [ZSPD-SW]
+    nics:
+      # net0 -> ZSPD-SW net1
+      - bridge: vmbr112
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: COD-GW
+    template: 1001
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [GW-1]
+    nics:
+      # net0 -> GW-1 net1
+      - bridge: vmbr104
+        model: e1000
+        firewall: false
+        link_down: false
+      # net1 -> COD-SW-CORE net0
+      - bridge: vmbr105
+        model: e1000
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: COD-SW-CORE
+    template: 1006
+    cores: 1
+    sockets: 1
+    memory: 1024
+    replace_nics: true
+    depends_on: [COD-GW]
+    nics:
+      # net0 -> COD-GW net1
+      - bridge: vmbr105
+        model: virtio
+        firewall: false
+        link_down: false
+      # net1 -> COD-ADMIN net0
+      - bridge: vmbr106
+        model: virtio
+        firewall: false
+        link_down: false
+      # net2 -> DATA net0
+      - bridge: vmbr107
+        model: virtio
+        firewall: false
+        link_down: false
+      # net3 -> COD-SRV net0
+      - bridge: vmbr108
+        model: virtio
+        firewall: false
+        link_down: false
+      # net4 -> PUB net0
+      - bridge: vmbr109
+        model: virtio
+        firewall: false
+        link_down: false
+      # net5 -> NODE net0
+      - bridge: vmbr110
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: COD-ADMIN
+    template: 1007
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [COD-SW-CORE]
+    nics:
+      # net0 -> COD-SW-CORE net1
+      - bridge: vmbr106
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: COD-SRV
+    template: 1008
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [COD-SW-CORE]
+    nics:
+      # net0 -> COD-SW-CORE net3
+      - bridge: vmbr108
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: DATA
+    template: 1009
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [COD-SW-CORE]
+    nics:
+      # net0 -> COD-SW-CORE net2
+      - bridge: vmbr107
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: PUB
+    template: 1010
+    cores: 2
+    sockets: 1
+    memory: 4096
+    replace_nics: true
+    depends_on: [COD-SW-CORE]
+    nics:
+      # net0 -> COD-SW-CORE net4
+      - bridge: vmbr109
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+  - name: NODE
+    template: 1012
+    cores: 4
+    sockets: 1
+    memory: 8192
+    replace_nics: true
+    depends_on: [COD-SW-CORE]
+    nics:
+      # net0 -> COD-SW-CORE net5
+      - bridge: vmbr110
+        model: virtio
+        firewall: false
+        link_down: false
+    start: true
+
+users: []
+
+# После развёртывания выполните scripts/prepare-region-l2.py --manifest region-l2.manifest.json --apply на SF-4.
+# Это разрешит LLDP на внутренних TAP-портах и LACP на двух линиях
+# PROVIDER-SW <-> PROVIDER-GW, не задавая VLAN и не создавая bond.
+
+# Имя узла и VMID ниже — примеры. Замените на реальные значения вашего кластера.
+nodes:
+  REPLACE-NODE2:
+    templates:
+      1001: 2001
+      1003: 2003
+      1004: 2004
+      1005: 2005
+      1006: 2006
+      1007: 2007
+      1008: 2008
+      1009: 2009
+      1010: 2010
+      1012: 2012
+
+participants:
+  - id: A0
+    bridge_base: 1001
+    users:
+      - id: Competitor-A0@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A1
+    bridge_base: 1101
+    users:
+      - id: Competitor-A1@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A2
+    bridge_base: 1201
+    users:
+      - id: Competitor-A2@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A3
+    bridge_base: 1301
+    users:
+      - id: Competitor-A3@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A4
+    bridge_base: 1401
+    users:
+      - id: Competitor-A4@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A5
+    node: REPLACE-NODE2
+    bridge_base: 1501
+    users:
+      - id: Competitor-A5@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A6
+    node: REPLACE-NODE2
+    bridge_base: 1601
+    users:
+      - id: Competitor-A6@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A7
+    node: REPLACE-NODE2
+    bridge_base: 1701
+    users:
+      - id: Competitor-A7@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A8
+    node: REPLACE-NODE2
+    bridge_base: 1801
+    users:
+      - id: Competitor-A8@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser
+  - id: A9
+    node: REPLACE-NODE2
+    bridge_base: 1901
+    users:
+      - id: Competitor-A9@pve
+        password_env: REGION_COMPETITOR_PASSWORD
+        role: PVEVMUser

@@ -38,8 +38,9 @@ func yamlHint(data []byte, err error) string {
 	}
 	return "\nПроверьте отступы: используйте пробелы, а не табуляцию"
 }
-func (c *Config) resolveSecrets(base string) error {
-	resolve := func(users []User) error {
+func (c *Config) resolveSecrets(base string) error { return c.resolveSecretRefs(base, true) }
+func (c *Config) resolveSecretRefs(base string, read bool) error {
+	resolve := func(users []User, read bool) error {
 		for i := range users {
 			u := &users[i]
 			n := 0
@@ -50,6 +51,9 @@ func (c *Config) resolveSecrets(base string) error {
 			}
 			if n != 1 {
 				return fmt.Errorf("пользователь %s: задайте ровно одно из password/password_env/password_file", u.ID)
+			}
+			if !read {
+				continue
 			}
 			if u.PasswordEnv != "" {
 				v, ok := os.LookupEnv(u.PasswordEnv)
@@ -69,14 +73,23 @@ func (c *Config) resolveSecrets(base string) error {
 				}
 				u.Password = v
 			}
+			if len(u.Password) < 8 {
+				return fmt.Errorf("пользователь %s: пароль короче 8 символов", u.ID)
+			}
 		}
 		return nil
 	}
-	if err := resolve(c.Users); err != nil {
+	topUsed := len(c.Participants) == 0
+	for _, p := range c.Participants {
+		if (c.ParticipantOnly == "" || c.ParticipantOnly == p.ID) && len(p.Users) == 0 {
+			topUsed = true
+		}
+	}
+	if err := resolve(c.Users, read && topUsed); err != nil {
 		return err
 	}
 	for i := range c.Participants {
-		if err := resolve(c.Participants[i].Users); err != nil {
+		if err := resolve(c.Participants[i].Users, read && (c.ParticipantOnly == "" || c.ParticipantOnly == c.Participants[i].ID)); err != nil {
 			return err
 		}
 	}

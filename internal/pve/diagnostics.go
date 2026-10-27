@@ -189,3 +189,20 @@ func retryableRead(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
 }
+
+// StorageShared uses the index API (Datastore.Audit), not the privileged config-read endpoint.
+func (c *Client) StorageShared(ctx context.Context, storage string) (bool, error) {
+	var rows []struct {
+		Storage string  `json:"storage"`
+		Shared  APIBool `json:"shared"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/storage", nil, &rows); err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if row.Storage == storage {
+			return bool(row.Shared), nil
+		}
+	}
+	return false, fmt.Errorf("хранилище %s отсутствует в доступном списке /storage", storage)
+}

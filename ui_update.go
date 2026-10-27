@@ -10,11 +10,23 @@ import (
 
 // ---------- Обновление ----------
 
-func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateCore(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
+		m.width = msg.Width
 		return m, nil
+
+	case splashTickMsg:
+		if !m.splash {
+			return m, nil
+		}
+		m.splashElapsed = time.Time(msg).Sub(m.splashStart)
+		if m.splashElapsed >= splashDuration {
+			m.splash = false
+			return m, nil
+		}
+		return m, splashTickCmd()
 
 	case tickMsg:
 		if m.st == stRun {
@@ -36,6 +48,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleDestroyPreview(msg)
 
 	case statusMsg:
+		m.logOffset = 0
 		m.statusRows = msg.rows
 		m.statusErr = ""
 		if msg.err != nil {
@@ -145,6 +158,14 @@ func (m *model) handleDestroyPreview(msg destroyPreviewMsg) (tea.Model, tea.Cmd)
 
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if m.splash {
+		if key == "ctrl+c" {
+			return m, tea.Quit
+		}
+		// Consume the skip key so Enter cannot trigger a menu action.
+		m.splash = false
+		return m, nil
+	}
 	if key == "ctrl+c" {
 		if m.st == stRun && m.cancel != nil {
 			m.cancelled = true
@@ -221,7 +242,54 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case stParticipantPick:
+		switch key {
+		case "up", "k":
+			if m.participantCursor > 0 {
+				m.participantCursor--
+			}
+		case "down", "j":
+			if m.participantCursor < len(m.cfg.Participants) {
+				m.participantCursor++
+			}
+		case "enter":
+			id := ""
+			if m.participantCursor > 0 {
+				id = m.cfg.Participants[m.participantCursor-1].ID
+			}
+			if m.cfgPath != "" {
+				fresh, err := stand.LoadForParticipant(m.cfgPath, id)
+				if err != nil {
+					m.participantErr = err.Error()
+					return m, nil
+				}
+				m.cfg = fresh
+			} else if err := m.cfg.SelectParticipant(id); err != nil {
+				m.participantErr = err.Error()
+				return m, nil
+			}
+			if m.cli != nil {
+				m.cli.SetSecrets(m.cfg.Secrets())
+			}
+			m.participantErr = ""
+			m.participant = id
+			m.only = ""
+			m.st = stMenu
+		case "esc":
+			m.st = stMenu
+		}
+		return m, nil
 	case stMenu:
+		if key == "p" && m.cfg.HasParticipants() {
+			m.participantCursor = 0
+			for i, p := range m.cfg.Participants {
+				if p.ID == m.cfg.ParticipantOnly {
+					m.participantCursor = i + 1
+				}
+			}
+			m.st = stParticipantPick
+			return m, nil
+		}
 		switch key {
 		case "up", "k":
 			if m.cursor > 0 {

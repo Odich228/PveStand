@@ -13,6 +13,18 @@ func Execute(ctx context.Context, c *pve.Client, cfg *Config, action string, par
 	if parallel < 1 {
 		return fmt.Errorf("parallel должен быть >= 1")
 	}
+	if err := cfg.SelectParticipant(cfg.ParticipantOnly); err != nil {
+		return err
+	}
+	if action == "deploy" {
+		for _, inst := range cfg.Instances() {
+			for _, u := range inst.Users {
+				if len(u.Password) < 8 {
+					return fmt.Errorf("пользователь %s: перед deploy прочитайте пароль через Load/LoadForParticipant", u.ID)
+				}
+			}
+		}
+	}
 	if err := Bind(c, cfg); err != nil {
 		return err
 	}
@@ -21,6 +33,20 @@ func Execute(ctx context.Context, c *pve.Client, cfg *Config, action string, par
 		return err
 	}
 	defer release()
+	if err := cfg.checkLayouts(); err != nil {
+		return err
+	}
+	if action == "deploy" {
+		r := Check(ctx, c, cfg)
+		for _, line := range append(r.Info, r.Warnings...) {
+			if emit != nil {
+				emit(Event{Msg: line})
+			}
+		}
+		if !r.OK() {
+			return fmt.Errorf("проверка перед развёртыванием:\n%s", strings.Join(r.Errors, "\n"))
+		}
+	}
 	// Recover lost clone acknowledgements before changing other resources.
 	// Re-submission is permitted only by the explicit CLI -retry-clone option.
 	retryMatched := cfg.RetryClone == ""
@@ -75,15 +101,10 @@ func Execute(ctx context.Context, c *pve.Client, cfg *Config, action string, par
 	if !retryMatched {
 		return fmt.Errorf("для %s нет неподтверждённого clone в журнале; повтор не выполнялся", cfg.RetryClone)
 	}
+
 	if action == "deploy" {
-		r := Check(ctx, c, cfg)
-		for _, line := range append(r.Info, r.Warnings...) {
-			if emit != nil {
-				emit(Event{Msg: line})
-			}
-		}
-		if !r.OK() {
-			return fmt.Errorf("проверка перед развёртыванием:\n%s", strings.Join(r.Errors, "\n"))
+		if err := cfg.saveLayouts(); err != nil {
+			return err
 		}
 	}
 	// Resume known server tasks before issuing any new mutation, including deletion.
@@ -143,13 +164,19 @@ func Execute(ctx context.Context, c *pve.Client, cfg *Config, action string, par
 	if !found {
 		return fmt.Errorf("ВМ %q не найдена", cfg.Only)
 	}
+	if action == "destroy" {
+		return cfg.releaseEmptyLayouts()
+	}
 	return nil
 }
 func LivePlan(ctx context.Context, c *pve.Client, cfg *Config) ([]string, error) {
 	if err := Bind(c, cfg); err != nil {
 		return nil, err
 	}
-	var out []string
+	if err := cfg.checkLayouts(); err != nil {
+		return nil, err
+	}
+	out := cfg.InstanceSummary()
 	for _, inst := range cfg.Instances() {
 		info, err := c.PoolInfo(ctx, inst.Pool)
 		switch {

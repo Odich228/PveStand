@@ -10,7 +10,14 @@ import (
 	"strings"
 )
 
-type PreflightReport struct{ Errors, Warnings, Info []string }
+type diskBudget struct {
+	Node, Storage string
+	Need, Avail   int64
+}
+type PreflightReport struct {
+	Errors, Warnings, Info []string
+	disks                  []diskBudget
+}
 
 func (r *PreflightReport) OK() bool { return len(r.Errors) == 0 }
 
@@ -20,6 +27,50 @@ func Preflight(ctx context.Context, c *pve.Client, cfg *Config, copies int) *Pre
 }
 func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 	r := &PreflightReport{}
+	if err := cfg.SelectParticipant(cfg.ParticipantOnly); err != nil {
+		r.Errors = append(r.Errors, err.Error())
+		return r
+	}
+	if err := Bind(c, cfg); err != nil {
+		r.Errors = append(r.Errors, err.Error())
+		return r
+	}
+	if err := cfg.checkLayouts(); err != nil {
+		r.Errors = append(r.Errors, err.Error())
+		return r
+	}
+	groups := map[string][]*Config{}
+	for _, inst := range cfg.Instances() {
+		groups[inst.Node] = append(groups[inst.Node], inst)
+	}
+	nodes := []string{}
+	for node := range groups {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	r.Info = append(r.Info, cfg.InstanceSummary()...)
+	for _, node := range nodes {
+		part := checkNode(ctx, c, cfg, groups[node], node)
+		r.disks = append(r.disks, part.disks...)
+		for _, line := range part.Info {
+			r.Info = append(r.Info, "["+node+"] "+line)
+		}
+		for _, line := range part.Errors {
+			r.Errors = append(r.Errors, "["+node+"] "+line)
+		}
+		for _, line := range part.Warnings {
+			r.Warnings = append(r.Warnings, "["+node+"] "+line)
+		}
+	}
+	checkSharedStorage(ctx, c, r)
+	if len(cfg.Instances()) > 1 {
+		r.Warnings = append(r.Warnings, "Внутренние мосты участников разделены; внешние мосты (например vmbr0) остаются общими. Для WAN нужны согласованные адреса и правила доступа.")
+	}
+	return r
+}
+
+func checkNode(ctx context.Context, c *pve.Client, cfg *Config, instances []*Config, node string) *PreflightReport {
+	r := &PreflightReport{}
 	if err := Bind(c, cfg); err != nil {
 		r.Errors = append(r.Errors, err.Error())
 		return r
@@ -28,9 +79,9 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 	if versionErr != nil {
 		r.Warnings = append(r.Warnings, "не удалось определить версию Proxmox: "+versionErr.Error())
 	}
-	total, free, err := c.NodeMemory(ctx, cfg.Node)
+	total, free, err := c.NodeMemory(ctx, node)
 	if err != nil {
-		r.Errors = append(r.Errors, fmt.Sprintf("не удалось прочитать состояние узла %s: %v", cfg.Node, err))
+		r.Errors = append(r.Errors, fmt.Sprintf("не удалось прочитать состояние узла %s: %v", node, err))
 		return r
 	}
 	all, err := c.ClusterVMs(ctx)
@@ -82,8 +133,8 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 			}
 		}
 	}
-	require("/nodes/"+cfg.Node, "Sys.Audit")
-	for _, inst := range cfg.Instances() {
+	require("/nodes/"+node, "Sys.Audit")
+	for _, inst := range instances {
 		selected := selectedVMs(inst)
 		if inst.Only != "" && len(selected) == 0 {
 			continue
@@ -108,6 +159,9 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 			if !ok {
 				require("/nodes/"+inst.Node, "Sys.Modify")
 				continue
+			}
+			if inst.isParticipant() && !ownedComment(fields["comments"], inst.marker()) {
+				r.Errors = append(r.Errors, fmt.Sprintf("участник %s: мост %s существует вне этого стенда; выберите другой bridge_base", inst.suffix, n.Bridge))
 			}
 			if fields["type"] != "bridge" {
 				r.Errors = append(r.Errors, fmt.Sprintf("%s не является bridge", n.Bridge))
@@ -179,8 +233,14 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 				effective := raw
 				running := false
 				if rec, found := inst.record("vm", name); found {
-					if pendingClone(rec) {
-						existing = true // No new clone may be planned until Execute reconciles this record.
+					if rec.Operation == "clone" && (pendingClone(rec) || rec.UPID != "") {
+						existing = true // Recovery validates ownership before any other mutation.
+						_, probeErr := c.VMConfigRaw(ctx, inst.Node, rec.VMID)
+						if pve.IsMissing(probeErr) {
+							existing = false
+						} else if probeErr != nil {
+							r.Errors = append(r.Errors, probeErr.Error())
+						}
 						r.Warnings = append(r.Warnings, fmt.Sprintf("%s: VMID %d, ответ clone потерян; перед изменениями программа уточнит результат по ВМ и задаче", name, rec.VMID))
 					} else {
 						current, e := checkVM(ctx, c, inst, rec)
@@ -288,7 +348,7 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 		r.Errors = append(r.Errors, "недостаточно свободной RAM для всех запланированных запусков")
 	}
 	for storage, bytes := range need {
-		st, e := c.StorageStatus(ctx, cfg.Node, storage)
+		st, e := c.StorageStatus(ctx, node, storage)
 		if e != nil {
 			r.Errors = append(r.Errors, fmt.Sprintf("хранилище %s: %v", storage, e))
 			continue
@@ -296,6 +356,7 @@ func Check(ctx context.Context, c *pve.Client, cfg *Config) *PreflightReport {
 		if (st.Active != nil && *st.Active == 0) || (st.Enabled != nil && *st.Enabled == 0) {
 			r.Errors = append(r.Errors, "хранилище "+storage+" не активно или выключено")
 		}
+		r.disks = append(r.disks, diskBudget{Node: node, Storage: storage, Need: bytes, Avail: st.Avail})
 		if st.Total == 0 {
 			r.Errors = append(r.Errors, "хранилище "+storage+" не сообщает доступный объём")
 		}
@@ -359,4 +420,43 @@ func humanBytes(b int64) string {
 		i++
 	}
 	return fmt.Sprintf("%.1f %s", x, units[i])
+}
+
+// The same shared storage must not be counted as independently free on each node.
+func checkSharedStorage(ctx context.Context, c *pve.Client, r *PreflightReport) {
+	groups := map[string][]diskBudget{}
+	for _, budget := range r.disks {
+		groups[budget.Storage] = append(groups[budget.Storage], budget)
+	}
+	names := []string{}
+	for name := range groups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		budgets := groups[name]
+		if len(budgets) < 2 {
+			continue
+		}
+		shared, err := c.StorageShared(ctx, name)
+		if err != nil {
+			r.Errors = append(r.Errors, fmt.Sprintf("не удалось проверить общий доступ хранилища %s: %v", name, err))
+			continue
+		}
+		if !shared {
+			continue
+		}
+		var required int64
+		available := budgets[0].Avail
+		for _, budget := range budgets {
+			required += budget.Need
+			if budget.Avail < available {
+				available = budget.Avail
+			}
+		}
+		r.Info = append(r.Info, fmt.Sprintf("Общее хранилище %s: все узлы вместе требуют примерно %s, свободно %s", name, humanBytes(required), humanBytes(available)))
+		if required > available {
+			r.Errors = append(r.Errors, fmt.Sprintf("общее хранилище %s: недостаточно места для суммарного плана всех узлов", name))
+		}
+	}
 }

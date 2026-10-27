@@ -313,6 +313,9 @@ func ensureBridge(ctx context.Context, c *pve.Client, cfg *Config, n Network) er
 		return err
 	}
 	if ok {
+		if cfg.isParticipant() && !ownedComment(fields["comments"], cfg.marker()) {
+			return fmt.Errorf("мост %s существует вне стенда %s; выберите другой bridge_base", n.Bridge, cfg.suffix)
+		}
 		if fields["type"] != "bridge" {
 			return fmt.Errorf("%s существует и не является bridge", n.Bridge)
 		}

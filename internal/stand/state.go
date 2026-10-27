@@ -32,6 +32,7 @@ type journal struct {
 	Owner     string              `json:"owner"`
 	Endpoint  string              `json:"endpoint"`
 	Resources map[string]Resource `json:"resources"`
+	Layouts   map[string]Layout   `json:"layouts,omitempty"`
 }
 type Runtime struct {
 	mu   sync.Mutex
